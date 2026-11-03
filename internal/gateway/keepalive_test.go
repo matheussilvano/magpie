@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -297,42 +298,114 @@ func TestTranslatedSilenceKeptAliveForABound(t *testing.T) {
 	}
 }
 
+// pingCounter is a recorder that counts, as they are written, the keepalives
+// of a relayed reply (a ping event or a ": keepalive" comment), so a test can
+// wait for the keepalives it expects instead of counting them in a window of
+// wall-clock time that a loaded machine can overrun.
+type pingCounter struct {
+	*httptest.ResponseRecorder
+	mu    sync.Mutex
+	pings int
+}
+
+func (c *pingCounter) Write(p []byte) (int, error) {
+	n := strings.Count(string(p), `"type":"ping"`) + strings.Count(string(p), ": keepalive")
+	c.mu.Lock()
+	c.pings += n
+	c.mu.Unlock()
+	return c.ResponseRecorder.Write(p)
+}
+
+// WriteString is io.WriteString's way in, which a comment takes.
+func (c *pingCounter) WriteString(s string) (int, error) { return c.Write([]byte(s)) }
+
+func (c *pingCounter) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pings
+}
+
+// waitForPings waits, as long as a loaded machine may need, until w has
+// written n keepalives.
+func waitForPings(w *pingCounter, n int) bool {
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(time.Millisecond) {
+		if w.count() >= n {
+			return true
+		}
+	}
+	return false
+}
+
 // TestRelayKeepsClientAlive: a relayed reply (the Claude subscription's
 // bridge, Kiro, Cursor, …) that goes quiet keeps its client alive every
-// keepaliveEvery, but only for keepaliveLongest since its last event.
+// keepaliveEvery.
+//
+// The test waits for the keepalives themselves, never for a count inside a
+// window of wall-clock time: on a machine under load the ticker fires late
+// and a window of 150ms held one ping where it expected three (#4184).
+// keepaliveLongest is set far past anything the test waits for, since
+// keepalives stop that long after the last event, and a window of it is a
+// wall-clock bound too.
 func TestRelayKeepsClientAlive(t *testing.T) {
-	keepFast(t, keepaliveGap, 20*time.Millisecond, 200*time.Millisecond)
+	keepFast(t, keepaliveGap, 20*time.Millisecond, time.Minute)
+	w := &pingCounter{ResponseRecorder: httptest.NewRecorder()}
+	var kept bool // set by the sender, read after relay returns (the close of events orders them)
 	events := make(chan Event)
 	go func() {
+		defer close(events)
 		events <- Event{Kind: KStart, MsgID: "m1"}
 		events <- Event{Kind: KText, Text: "progress"}
-		time.Sleep(150 * time.Millisecond) // kept alive
-		events <- Event{Kind: KText, Text: " more"}
-		time.Sleep(600 * time.Millisecond) // kept alive for 200ms only
+		kept = waitForPings(w, 3)
 		events <- Event{Kind: KStop, Stop: "end_turn"}
-		close(events)
 	}()
-	rec := httptest.NewRecorder()
 	req := &Request{Model: "m1", Stream: true}
 	r := httptest.NewRequest("POST", "/v1/messages", nil)
-	code, failed := relay(rec, r, provider.Anthropic, "Bridge", req, events, &Usage{}, func() {}, nil, func(string, string, bool) {})
+	code, failed := relay(w, r, provider.Anthropic, "Bridge", req, events, &Usage{}, func() {}, nil, func(string, string, bool) {})
 	if code != 200 || failed != "" {
 		t.Fatalf("relay: %d %q", code, failed)
 	}
-	body := rec.Body.String()
-	parts := strings.SplitN(body, "more", 2)
-	if len(parts) != 2 || !strings.Contains(body, "message_stop") {
+	body := w.Body.String()
+	if !strings.Contains(body, "progress") || !strings.Contains(body, "message_stop") {
 		t.Fatalf("reply incomplete:\n%s", body)
 	}
-	// a ping or, within pingEvery of the last, a comment
-	alive := func(s string) int { return strings.Count(s, `"type":"ping"`) + strings.Count(s, ": keepalive") }
-	before, after := alive(parts[0]), alive(parts[1])
-	t.Logf("pings in a 150ms gap: %d, in a 600ms gap (200ms kept): %d", before, after)
-	if before < 3 {
-		t.Fatalf("a quiet reply wasn't kept alive: %d pings in 150ms", before)
+	if !kept {
+		t.Fatalf("a quiet reply wasn't kept alive: %d keepalives, wanted 3", w.count())
 	}
-	if after < 3 || after > 12 {
-		t.Fatalf("a reply quiet past keepaliveLongest was kept alive on: %d pings", after)
+}
+
+// TestRelayStopsKeepingClientAliveAfterKeepaliveLongest: a relayed reply
+// that stays quiet past keepaliveLongest since its last event is left for
+// its client's own idle timeout, and gets no more keepalives.
+//
+// There is no lower bound on how many keepalives came before: how many a
+// loaded machine's ticker fires in keepaliveLongest is not what this is
+// about. Once keepaliveLongest has passed, the count must stop moving, and
+// it does however late the scheduler runs, since the quiet time is read when
+// each tick is handled (#4184).
+func TestRelayStopsKeepingClientAliveAfterKeepaliveLongest(t *testing.T) {
+	const every, longest = 20 * time.Millisecond, 200 * time.Millisecond
+	keepFast(t, keepaliveGap, every, longest)
+	w := &pingCounter{ResponseRecorder: httptest.NewRecorder()}
+	var whenCut, later int // set by the sender, read after relay returns
+	events := make(chan Event)
+	go func() {
+		defer close(events)
+		events <- Event{Kind: KStart, MsgID: "m1"}
+		events <- Event{Kind: KText, Text: "progress"}
+		time.Sleep(longest + 10*every)
+		whenCut = w.count()
+		time.Sleep(10 * every)
+		later = w.count()
+		events <- Event{Kind: KStop, Stop: "end_turn"}
+	}()
+	req := &Request{Model: "m1", Stream: true}
+	r := httptest.NewRequest("POST", "/v1/messages", nil)
+	code, failed := relay(w, r, provider.Anthropic, "Bridge", req, events, &Usage{}, func() {}, nil, func(string, string, bool) {})
+	if code != 200 || failed != "" {
+		t.Fatalf("relay: %d %q", code, failed)
+	}
+	if later != whenCut {
+		t.Fatalf("a reply quiet past keepaliveLongest was kept alive on: %d keepalives when it was cut, %d later", whenCut, later)
 	}
 }
 
